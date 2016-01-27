@@ -1,6 +1,6 @@
 /*
  * Validity VFS0050 driver for libfprint
- * Copyright (C) 2015 Konstantin Semenov <zemen17@gmail.com>
+ * Copyright (C) 2015-2016 Konstantin Semenov <zemen17@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -39,8 +39,6 @@ static void async_write_callback(struct libusb_transfer *transfer)
 	int transferred = transfer->actual_length, error =
 	    transfer->status, len = transfer->length;
 
-	libusb_free_transfer(transfer);
-
 	if (error != 0) {
 		fp_err("USB write transfer: %s", libusb_error_name(error));
 		fpi_imgdev_session_error(idev, -EIO);
@@ -66,6 +64,7 @@ static void async_write(struct fpi_ssm *ssm, void *data, int len)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	vdev->transfer = libusb_alloc_transfer(0);
+	vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
 	libusb_fill_bulk_transfer(vdev->transfer, udev, 0x01, data, len,
 				  async_write_callback, ssm, VFS_USB_TIMEOUT);
 	libusb_submit_transfer(vdev->transfer);
@@ -80,8 +79,6 @@ static void async_read_callback(struct libusb_transfer *transfer)
 	int transferred = transfer->actual_length, error =
 	    transfer->status, len = transfer->length;
 	int ep = transfer->endpoint;
-
-	libusb_free_transfer(transfer);
 
 	if (error != 0) {
 		fp_err("USB read transfer on endpoint %d: %s", ep - 0x80,
@@ -111,6 +108,7 @@ static void async_read(struct fpi_ssm *ssm, int ep, void *data, int len)
 	ep |= LIBUSB_ENDPOINT_IN;
 
 	vdev->transfer = libusb_alloc_transfer(0);
+	vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
 
 	/* 0x83 is the only interrupt endpoint */
 	if (ep == EP3_IN)
@@ -132,10 +130,6 @@ static void async_abort_callback(struct libusb_transfer *transfer)
 
 	int transferred = transfer->actual_length, error = transfer->status;
 	int ep = transfer->endpoint;
-
-	/* Free trash buffer, we don't need it */
-	g_free(transfer->buffer);
-	libusb_free_transfer(transfer);
 
 	/* In normal case endpoint is empty */
 	if (error == LIBUSB_TRANSFER_TIMED_OUT) {
@@ -171,6 +165,8 @@ static void async_abort(struct fpi_ssm *ssm, int ep)
 	ep |= LIBUSB_ENDPOINT_IN;
 
 	vdev->transfer = libusb_alloc_transfer(0);
+	vdev->transfer->flags |=
+	    LIBUSB_TRANSFER_FREE_TRANSFER | LIBUSB_TRANSFER_FREE_BUFFER;
 
 	/* 0x83 is the only interrupt endpoint */
 	if (ep == EP3_IN)
@@ -182,6 +178,110 @@ static void async_abort(struct fpi_ssm *ssm, int ep)
 					  async_abort_callback, ssm,
 					  VFS_USB_ABORT_TIMEOUT);
 	libusb_submit_transfer(vdev->transfer);
+}
+
+/* Image processing functions */
+
+/* Pixel getter for fpi_assemble_lines */
+static unsigned char vfs0050_get_pixel(struct fpi_line_asmbl_ctx *ctx,
+				       GSList * line, unsigned int x)
+{
+	return ((struct vfs_line *)line->data)->data[x];
+}
+
+/* Deviation getter for fpi_assemble_lines */
+static int vfs0050_get_difference(struct fpi_line_asmbl_ctx *ctx,
+				  GSList * line_list_1, GSList * line_list_2)
+{
+	struct vfs_line *line1 = line_list_1->data;
+	struct vfs_line *line2 = line_list_2->data;
+	const int shift = (VFS_IMAGE_WIDTH - VFS_NEXT_LINE_WIDTH) / 2 - 1;	// -1 was chosen after experiments
+	int res = 0;
+	for (int i = 0; i < VFS_NEXT_LINE_WIDTH; ++i) {
+		int x =
+		    (int)line1->next_line_part[i] - (int)line2->data[shift + i];
+		res += x * x;
+	}
+	return res;
+}
+
+#define VFS_NOISE_THRESHOLD 40
+
+/* Checks whether line is noise or not using hardware parameters */
+static char is_noise(struct vfs_line *line)
+{
+	int val1 = line->noise_hash_1;
+	int val2 = line->noise_hash_2;
+	if (val1 > VFS_NOISE_THRESHOLD
+	    && val1 < 256 - VFS_NOISE_THRESHOLD
+	    && val2 > VFS_NOISE_THRESHOLD && val2 < 256 - VFS_NOISE_THRESHOLD)
+		return 1;
+	return 0;
+}
+
+/* Parameters for fpi_assemble_lines */
+static struct fpi_line_asmbl_ctx assembling_ctx = {
+	.line_width = VFS_IMAGE_WIDTH,
+	.max_height = VFS_MAX_HEIGHT,
+	.resolution = 10,
+	.median_filter_size = 25,
+	.max_search_offset = 100,
+	.get_deviation = vfs0050_get_difference,
+	.get_pixel = vfs0050_get_pixel,
+};
+
+/* Processes image before submitting */
+static struct fp_img *prepare_image(struct vfs_dev_t *vdev)
+{
+	int height = vdev->bytes / VFS_LINE_SIZE;
+
+	/* Noise cleaning. IMHO, it works pretty well
+	   I've not detected cases when it doesn't work or cuts a part of the finger
+	   Noise arises at the end of scan when some water remains on the scanner */
+	while (height > 0) {
+		if (!is_noise(vdev->lines_buffer + height - 1))
+			break;
+		--height;
+	}
+	if (height > VFS_MAX_HEIGHT)
+		height = VFS_MAX_HEIGHT;
+
+	/* If image is not good enough */
+	if (height < VFS_IMAGE_WIDTH) {
+		struct fp_img *img =
+		    fpi_img_new(VFS_IMAGE_WIDTH * VFS_IMAGE_WIDTH);
+		img->height = img->width = VFS_IMAGE_WIDTH;
+		memset(img->data, 0, img->width * img->height);
+		return img;
+	}
+
+	/* Building GSList */
+	GSList *lines = NULL;
+	for (int i = height - 1; i >= 0; --i)
+		lines = g_slist_prepend(lines, vdev->lines_buffer + i);
+
+	/* Perform line assembling */
+	struct fp_img *img = fpi_assemble_lines(&assembling_ctx, lines, height);
+
+	g_slist_free(lines);
+	return img;
+}
+
+/* Processes and submits image after fingerprint received */
+static void submit_image(struct fp_img_dev *idev)
+{
+	struct vfs_dev_t *vdev = idev->priv;
+
+	/* We were not asked to submit image actually */
+	if (!vdev->active)
+		return;
+
+	struct fp_img *img = prepare_image(vdev);
+
+	fpi_imgdev_image_captured(idev, img);
+
+	/* Finger not on the scanner */
+	fpi_imgdev_report_finger_status(idev, 0);
 }
 
 /* Proto functions */
@@ -306,126 +406,9 @@ static void send_control_packet(struct fpi_ssm *ssm)
 /* Clears all fprint data */
 static void clear_data(struct vfs_dev_t *vdev)
 {
-	if (vdev->lines_buffer != NULL)
-		g_free(vdev->lines_buffer);
+	g_free(vdev->lines_buffer);
 	vdev->lines_buffer = NULL;
 	vdev->memory = vdev->bytes = 0;
-}
-
-#define VFS_NOISE_THRESHOLD 40
-
-static unsigned char vfs0050_get_pixel(struct fpi_line_asmbl_ctx *ctx,
-				       GSList * line, unsigned int x)
-{
-	return ((struct vfs_line *)line->data)->data[x];
-}
-
-static int vfs0050_get_difference(struct fpi_line_asmbl_ctx *ctx,
-				  GSList * line_list_1, GSList * line_list_2)
-{
-	struct vfs_line *line1 = line_list_1->data;
-	struct vfs_line *line2 = line_list_2->data;
-	int shift = (VFS_REAL_IMAGE_WIDTH - VFS_NEXT_LINE_WIDTH) / 2 - 1;	// -1 was chosen after experiments
-	int res = 0;
-	for (int i = 0; i < VFS_NEXT_LINE_WIDTH; ++i) {
-		int x =
-		    (int)line1->next_line_part[i] - (int)line2->data[shift + i];
-		res += x * x;
-	}
-	return res;
-}
-
-/* Checks whether line is noise or not using hardware parameters */
-static char is_noise(struct vfs_line *line)
-{
-	int val1 = line->noise_hash_1;
-	int val2 = line->noise_hash_2;
-	if (val1 > VFS_NOISE_THRESHOLD
-	    && val1 < 256 - VFS_NOISE_THRESHOLD
-	    && val2 > VFS_NOISE_THRESHOLD && val2 < 256 - VFS_NOISE_THRESHOLD)
-		return 1;
-	return 0;
-}
-
-/* Processes image before submitting */
-static struct fp_img *prepare_image(struct vfs_dev_t *vdev)
-{
-	int height = vdev->bytes / VFS_LINE_SIZE;
-
-	/* Noise cleaning. IMHO, it works pretty well
-	   I've not detected cases when it doesn't work or cuts a part of the finger
-	   Noise arises at the end of scan when some water remains on the scanner */
-	while (height > 0) {
-		if (!is_noise(vdev->lines_buffer + height - 1))
-			break;
-		--height;
-	}
-	if (height > VFS_MAX_HEIGHT)
-		height = VFS_MAX_HEIGHT;
-
-	/* If image is not good enough */
-	if (height < VFS_REAL_IMAGE_WIDTH) {
-		struct fp_img *img =
-		    fpi_img_new(VFS_RESULT_IMAGE_WIDTH *
-				VFS_RESULT_IMAGE_WIDTH);
-		img->height = img->width = VFS_RESULT_IMAGE_WIDTH;
-		memset(img->data, 0, img->width * img->height);
-		return img;
-	}
-
-	/* Building GSList */
-	GSList *lines = NULL;
-	for (int i = height - 1; i >= 0; --i)
-		lines = g_slist_prepend(lines, vdev->lines_buffer + i);
-
-	/* Perform line assembling */
-
-	struct fpi_line_asmbl_ctx assembling_ctx = {
-		.line_width = VFS_REAL_IMAGE_WIDTH,
-		.max_height = height,
-		.resolution = 10,
-		.median_filter_size = 25,
-		.max_search_offset = 100,
-		.get_deviation = vfs0050_get_difference,
-		.get_pixel = vfs0050_get_pixel,
-	};
-	struct fp_img *img = fpi_assemble_lines(&assembling_ctx, lines, height);
-
-	/* Adding white borders */
-	img->flags |= FP_IMG_PARTIAL;
-	height = img->height;
-	img = fpi_img_resize(img, height * VFS_RESULT_IMAGE_WIDTH + 10);
-	for (int i = height - 1; i >= 0; --i) {
-		g_memmove(img->data + i * VFS_RESULT_IMAGE_WIDTH +
-			  VFS_BORDER_WIDTH, img->data + i * img->width,
-			  img->width);
-	}
-	img->width = VFS_RESULT_IMAGE_WIDTH;
-	for (int i = 0; i < height; ++i) {
-		memset(img->data + i * img->width, 255, VFS_BORDER_WIDTH);
-		memset(img->data + (i + 1) * img->width - VFS_BORDER_WIDTH, 255,
-		       VFS_BORDER_WIDTH);
-	}
-
-	g_slist_free(lines);
-	return img;
-}
-
-/* Processes and submits image after fingerprint received */
-static void submit_image(struct fp_img_dev *idev)
-{
-	struct vfs_dev_t *vdev = idev->priv;
-
-	/* We were not asked to submit image actually */
-	if (!vdev->active)
-		return;
-
-	struct fp_img *img = prepare_image(vdev);
-
-	fpi_imgdev_image_captured(idev, img);
-
-	/* Finger not on the scanner */
-	fpi_imgdev_report_finger_status(idev, 0);
 }
 
 /* After receiving interrupt from EP3 */
@@ -437,8 +420,6 @@ static void interrupt_callback(struct libusb_transfer *transfer)
 
 	char *interrupt = vdev->interrupt;
 	int error = transfer->status, transferred = transfer->actual_length;
-
-	libusb_free_transfer(transfer);
 
 	vdev->wait_interrupt = 0;
 
@@ -457,27 +438,16 @@ static void interrupt_callback(struct libusb_transfer *transfer)
 	/* Interrupt size is VFS_INTERRUPT_SIZE bytes in all known cases */
 	if (transferred != VFS_INTERRUPT_SIZE) {
 		fp_err("Unknown interrupt size %d", transferred);
-		libusb_free_transfer(transfer);
 		/* Abort ssm */
 		fpi_imgdev_session_error(idev, -EIO);
 		fpi_ssm_mark_aborted(ssm, -EIO);
 		return;
 	}
 
-	if (memcmp(interrupt, interrupt2, VFS_INTERRUPT_SIZE) == 0) {
-		/* Go to the next ssm stage */
-		fpi_ssm_next_state(ssm);
-		return;
-	}
-
-	if (memcmp(interrupt, interrupt3, VFS_INTERRUPT_SIZE) == 0) {
-		/* Go to the next ssm stage */
-		fpi_ssm_next_state(ssm);
-		return;
-	}
-
-	/* Standard interrupt */
-	if (memcmp(interrupt, interrupt1, VFS_INTERRUPT_SIZE) == 0) {
+	/* Standard interrupts */
+	if (memcmp(interrupt, interrupt1, VFS_INTERRUPT_SIZE) == 0 ||
+	    memcmp(interrupt, interrupt2, VFS_INTERRUPT_SIZE) == 0 ||
+	    memcmp(interrupt, interrupt3, VFS_INTERRUPT_SIZE) == 0) {
 		/* Go to the next ssm stage */
 		fpi_ssm_next_state(ssm);
 		return;
@@ -492,7 +462,7 @@ static void interrupt_callback(struct libusb_transfer *transfer)
 		return;
 	}
 
-	/* TODO: handle all interrupts */
+	/* Unknown interrupt; abort the session */
 	fp_err("Unknown interrupt '%02x:%02x:%02x:%02x:%02x'!",
 	       interrupt[0] & 0xff, interrupt[1] & 0xff, interrupt[2] & 0xff,
 	       interrupt[3] & 0xff, interrupt[4] & 0xff);
@@ -509,8 +479,6 @@ static void receive_callback(struct libusb_transfer *transfer)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	int transferred = transfer->actual_length, error = transfer->status;
-
-	libusb_free_transfer(transfer);
 
 	if (error != 0 && error != LIBUSB_TRANSFER_TIMED_OUT) {
 		fp_err("USB read transfer: %s", libusb_error_name(error));
@@ -616,6 +584,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 
 		/* Asyncronously enquire an interrupt */
 		vdev->transfer = libusb_alloc_transfer(0);
+		vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
 		libusb_fill_interrupt_transfer(vdev->transfer, udev, 0x83,
 					       vdev->interrupt,
 					       VFS_INTERRUPT_SIZE,
@@ -646,8 +615,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	case SSM_RECEIVE_FINGER:
 		if (vdev->memory == 0) {
 			/* Initialize fingerprint buffer */
-			if (vdev->lines_buffer != NULL)
-				g_free(vdev->lines_buffer);
+			g_free(vdev->lines_buffer);
 			vdev->memory = VFS_USB_BUFFER_SIZE;
 			vdev->lines_buffer = g_malloc(vdev->memory);
 			vdev->bytes = 0;
@@ -666,6 +634,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 
 		/* Receive chunk of data */
 		vdev->transfer = libusb_alloc_transfer(0);
+		vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
 		libusb_fill_bulk_transfer(vdev->transfer, udev, 0x82,
 					  (void *)vdev->lines_buffer +
 					  vdev->bytes, VFS_USB_BUFFER_SIZE,
@@ -813,7 +782,7 @@ struct fp_img_driver vfs0050_driver = {
 
 	/* Image specification */
 	.flags = 0,
-	.img_width = VFS_RESULT_IMAGE_WIDTH,
+	.img_width = VFS_IMAGE_WIDTH,
 	.img_height = -1,
 	.bz3_threshold = 24,
 

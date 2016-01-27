@@ -1,6 +1,6 @@
 /*
  * Validity VFS0050 driver for libfprint
- * Copyright (C) 2015 Konstantin Semenov <zemen17@gmail.com>
+ * Copyright (C) 2015-2016 Konstantin Semenov <zemen17@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -32,14 +32,9 @@
 #define VFS_LINE_SIZE 148
 /* Width of narrow stripe from the center */
 #define VFS_NEXT_LINE_WIDTH 32
-/* Only fprint image width from scanner */
-#define VFS_REAL_IMAGE_WIDTH 100
-
-/* Image width after adding white borders */
-#define VFS_RESULT_IMAGE_WIDTH 140
-/* Border width */
-#define VFS_BORDER_WIDTH ((VFS_RESULT_IMAGE_WIDTH - VFS_REAL_IMAGE_WIDTH) / 2)
-/* Maximum image height */
+/* Image width from scanner */
+#define VFS_IMAGE_WIDTH 100
+/* Maximum image height after assembling */
 #define VFS_MAX_HEIGHT 3000
 
 /* Size of control packets: turn_on, turn_off, next_receive_*  */
@@ -69,7 +64,7 @@ struct vfs_line {
 	unsigned short _somedata;
 
 	/* Fingerprint image */
-	unsigned char data[VFS_REAL_IMAGE_WIDTH];
+	unsigned char data[VFS_IMAGE_WIDTH];
 
 	/* Narrow fingerprint part from the center used for variable speed lines assembling */
 	unsigned char next_line_part[VFS_NEXT_LINE_WIDTH];
